@@ -4,11 +4,12 @@ use std::error::Error;
 
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::Sample;
 
 mod bitreader;
 use bitreader::{BitReader, FromBytes};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about="Play raw audio samples from stdin", long_about=None)]
 struct Opt {
     /// Playback sample rate.
@@ -18,6 +19,14 @@ struct Opt {
     /// Size of samples, supports: 8, 16, 32, 64
     #[arg(short='s', long, default_value_t = 32)]
     sample_size: u32,
+
+    /// Number of channels in the audio stream
+    #[arg(short, long, default_value_t = 2)]
+    channels: u16,
+
+    /// Loudness of the audio from 0.0 to 1.0
+    #[arg(short, long, default_value_t = 1.0)]
+    gain: f32,
 
     /// Interpret integer samples as unsigned, incompatible with --float
     #[arg(short, long, default_value_t = false)]
@@ -31,10 +40,6 @@ struct Opt {
     #[arg(short, long, default_value_t = false)]
     be: bool,
 
-    /// Number of channels in the audio stream
-    #[arg(short, long, default_value_t = 2)]
-    channels: u16,
-
     /// Suppress non-fatal errors
     #[arg(short, long, default_value_t = false)]
     quiet: bool,
@@ -42,7 +47,7 @@ struct Opt {
 
 /// Sanity checks the sample format configuration, emits some errors.
 /// Returns the sample format in the appropriate [cpal::SampleFormat] enum.
-fn config_sanity_check(opt: &Opt) -> Result<cpal::SampleFormat, String> {
+fn config_sanity_check(opt: &mut Opt) -> Result<cpal::SampleFormat, String> {
     use cpal::SampleFormat::*;
     let sample_format = match (opt.float, opt.unsigned, opt.sample_size) {
         (false, false, 8) => I8,
@@ -82,14 +87,20 @@ fn config_sanity_check(opt: &Opt) -> Result<cpal::SampleFormat, String> {
         if opt.sample_rate < 8000 {
             eprintln!("[!] low sample rate (<8kHz), audio may be very distorted");
         }
+
+        if !(0.0 <= opt.gain && opt.gain <= 1.0) {
+            eprintln!("[!] invalid gain value {}, will be clamped between 0.0 and 1.0", opt.gain);
+        }
     }
+
+    opt.gain = opt.gain.clamp(0.0, 1.0).mul_amp(0.1);
 
     Ok(sample_format)
 }
 
 fn main() {
-    let opt = Opt::parse();
-    let result = config_sanity_check(&opt);
+    let mut opt = Opt::parse();
+    let result = config_sanity_check(&mut opt);
     if let Err(msg) = result {
         eprintln!("{msg}");
         process::exit(1);
@@ -118,43 +129,37 @@ fn main() {
         cpal::SupportedBufferSize::Unknown,
         oconfig.sample_format(),
     );
-    let be = opt.be;
-    let quiet = opt.quiet;
 
     let iformat = iconfig_s.sample_format();
     match iformat {
-        cpal::SampleFormat::I8  => run::< i8>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
-        cpal::SampleFormat::U8  => run::< u8>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
+        cpal::SampleFormat::I8  => run::< i8>(&device, &oconfig.into(), opt),
+        cpal::SampleFormat::U8  => run::< u8>(&device, &oconfig.into(), opt),
 
-        cpal::SampleFormat::I16 => run::<i16>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
-        cpal::SampleFormat::U16 => run::<u16>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
+        cpal::SampleFormat::I16 => run::<i16>(&device, &oconfig.into(), opt),
+        cpal::SampleFormat::U16 => run::<u16>(&device, &oconfig.into(), opt),
 
-        cpal::SampleFormat::I32 => run::<i32>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
-        cpal::SampleFormat::U32 => run::<u32>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
+        cpal::SampleFormat::I32 => run::<i32>(&device, &oconfig.into(), opt),
+        cpal::SampleFormat::U32 => run::<u32>(&device, &oconfig.into(), opt),
 
-        cpal::SampleFormat::I64 => run::<i64>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
-        cpal::SampleFormat::U64 => run::<u64>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
+        cpal::SampleFormat::I64 => run::<i64>(&device, &oconfig.into(), opt),
+        cpal::SampleFormat::U64 => run::<u64>(&device, &oconfig.into(), opt),
 
-        cpal::SampleFormat::F32 => run::<f32>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
-        cpal::SampleFormat::F64 => run::<f64>(&device, &iconfig.into(), &oconfig.into(),be, quiet),
+        cpal::SampleFormat::F32 => run::<f32>(&device, &oconfig.into(), opt),
+        cpal::SampleFormat::F64 => run::<f64>(&device, &oconfig.into(), opt),
         sample_format => panic!("Unsupported sample format '{sample_format}'"),
     }.unwrap();
 }
 
 fn run<I>(
     device: &cpal::Device,
-    iconfig: &cpal::StreamConfig,
     oconfig: &cpal::StreamConfig,
-    quiet: bool,
-    big_endian: bool,
+    opt: Opt,
 ) -> Result<(), Box<dyn Error>> 
 where 
   I: cpal::SizedSample + dasp_sample::ToSample<f32> + FromBytes {
-    let channels = iconfig.channels as usize;
-
     let stdin = io::stdin();
     let buffered_stdin = io::BufReader::new(stdin);
-    let mut bitreader = BitReader::new(buffered_stdin, big_endian);
+    let mut bitreader = BitReader::new(buffered_stdin, opt.be);
 
     let mut next_sample = move || -> I {
         bitreader.read()
@@ -162,14 +167,19 @@ where
             .unwrap()
     };
 
+    let quiet = opt.quiet;
+
     let err_fn = move |err| if !quiet {
         eprintln!("an error occurred on stream: {}", err)
     };
 
+    let gain = opt.gain;
+    let channels = oconfig.channels as usize;
+
     let stream = device.build_output_stream(
         &oconfig, 
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo|{
-            write_data(data, channels, &mut next_sample);
+            write_data(data, channels, gain, &mut next_sample);
         },
         err_fn,
         None,
@@ -184,13 +194,17 @@ where
 fn write_data<I>(
     output: &mut [f32],
     channels: usize,
+    gain: f32,
     next_sample: &mut dyn FnMut() -> I,
 )
 where
   I: cpal::SizedSample + dasp_sample::ToSample<f32> {
     for frame in output.chunks_mut(channels) {
         for sample in frame.iter_mut() {
-            let value = next_sample().to_sample::<f32>();
+            let value = next_sample()
+                .to_sample::<f32>()
+                .mul_amp(gain)
+                .clamp(-1.0, 1.0); // hard limiting
             *sample = value;
         }
     }
