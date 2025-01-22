@@ -1,3 +1,4 @@
+
 use std::io;
 use std::fs;
 use std::process;
@@ -5,12 +6,14 @@ use std::path::PathBuf;
 use std::error::Error;
 use std::str::FromStr;
 
+use bit_io::BitWriter;
+use bit_io::ToBytes;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
 
-mod bitreader;
-use bitreader::{BitReader, FromBytes};
+mod bit_io;
+use bit_io::{BitReader, FromBytes};
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about="Playback raw audio samples.", long_about=None)]
@@ -29,7 +32,7 @@ struct Opt {
 
     /// Loudness of the audio from 0.0 to 1.0
     ///
-    /// By default, the output amplitude is attenuated by a factor of 5
+    /// By default, the output amplitude is reduced to 1/3rd
     ///
     /// --dangerous allows for this value to be set to higher than 1.0
     ///
@@ -58,7 +61,7 @@ struct Opt {
     pre_out: bool,
 
     /// Disables the signal input attenuation step
-    /// By default, the output amplitude is reduced by a factor of 5
+    /// By default, the output amplitude is reduced to 1/3rd
     #[arg(long, default_value_t = false)]
     loud: bool,
 
@@ -179,7 +182,7 @@ fn config_sanity_check(opt: &mut Opt) -> Result<ValidConfigOut, String> {
     }
 
     if !opt.loud {
-        opt.gain = opt.gain.mul_amp(0.2);
+        opt.gain = opt.gain.mul_amp(0.33);
     }
 
     Ok(ValidConfigOut {
@@ -248,11 +251,15 @@ fn run<I>(
     oconfig: &cpal::StreamConfig,
     opt: Opt,
     input: Box<dyn io::Read + Send>,
-    mut output: Option<Box<dyn io::Write + Send>>,
+    output: Option<Box<dyn io::Write + Send>>,
 ) -> Result<(), Box<dyn Error>> 
 where 
-  I: cpal::SizedSample + dasp_sample::ToSample<f32> + FromBytes {
+  I: cpal::SizedSample + dasp_sample::ToSample<f32> + FromBytes + ToBytes {
     let mut bitreader = BitReader::new(input, opt.be);
+    let mut bitwriter = None;
+    if let Some(output) = output {
+        bitwriter = Some(BitWriter::new(output, opt.be));
+    }
 
     let mut next_sample = move || -> I {
         bitreader.read()
@@ -272,7 +279,12 @@ where
     let stream = device.build_output_stream(
         &oconfig, 
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo|{
-            write_data(data, channels, gain, &mut next_sample, pre_out, post_out, &mut output);
+            write_data(
+                data, channels, gain, 
+                &mut next_sample, 
+                pre_out, post_out, 
+                &mut bitwriter,
+            );
         },
         err_fn,
         None,
@@ -291,10 +303,10 @@ fn write_data<I>(
     next_sample: &mut dyn FnMut() -> I,
     pre_out: bool,
     post_out: bool,
-    out_io: &mut Option<Box<dyn io::Write + Send>>,
+    mut out_io: &mut Option<BitWriter<Box<dyn std::io::Write + Send>>>,
 )
 where
-  I: cpal::SizedSample + dasp_sample::ToSample<f32> {
+  I: cpal::SizedSample + dasp_sample::ToSample<f32> + ToBytes {
     for frame in output.chunks_mut(channels) {
         for sample in frame.iter_mut() {
             let pre_value = next_sample();
@@ -302,13 +314,16 @@ where
                 .to_sample::<f32>()
                 .mul_amp(gain);
 
-            // TODO: write samples to stdout if that is required
-            //let out_buf = match (&out_io, pre_out, post_out) {
-            //    (Some(out_io), true, false) => (),
-            //    (Some(out_io), false, true) => (),
-            //    (Some(out_io), true, true) => panic!("--pre and --post both enabled"),
-            //    _ => (),
-            //}
+            match (&mut out_io, pre_out, post_out) {
+                (Some(out_io), true, false) => {
+                    out_io.write(pre_value).unwrap();
+                },
+                (Some(out_io), false, true) => {
+                    out_io.write(post_value).unwrap();
+                },
+                (Some(_), true, true) => panic!("--pre and --post both enabled"),
+                _ => (),
+            }
 
             *sample = post_value;
         }
