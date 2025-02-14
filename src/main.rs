@@ -35,8 +35,6 @@ struct Opt {
     /// By default, the output amplitude is reduced to 1/3rd
     ///
     /// --dangerous allows for this value to be set to higher than 1.0
-    ///
-    /// --loud disables the default output attenuation
     #[arg(short, long, default_value_t = 1.0)]
     gain: f32,
 
@@ -60,22 +58,9 @@ struct Opt {
     #[arg(long="pre", default_value_t = false)]
     pre_out: bool,
 
-    /// Disables the signal input attenuation step
-    /// By default, the output amplitude is reduced to 1/3rd
-    #[arg(long, default_value_t = false)]
-    loud: bool,
-
     /// Disables limits on gain (-g, --gain)
     #[arg(long, default_value_t = false)]
     dangerous: bool,
-
-    /// Acknowledgement to use dangerous, unbounded features
-    ///
-    /// By enabling this option, you acknowledge the dangers associated with use or misuse of these features
-    /// 
-    /// Improper use of these features may lead to permanent hearing loss and/or damage of your speakers
-    #[arg(long, default_value_t = false)]
-    i_understand: bool,
 
     /// Input file path, if not specified, stdin will be used
     infile: Option<String>,
@@ -120,15 +105,12 @@ fn config_sanity_check(opt: &mut Opt) -> Result<ValidConfigOut, String> {
         },
     };
 
-    match (opt.pre_out, opt.post_out) {
-        (true, true) => {
-            return Err("Incompatible options '--pre' and '--post', can choose only one or none".into());
-        },
-        _ => (),
+    if let (true, true) = (opt.pre_out, opt.post_out) {
+        return Err("Incompatible options '--pre' and '--post', can choose only one or none".into());
     }
 
     let input: Box<dyn io::Read + Send> = if let Some(ref infile) = opt.infile {
-        let path = PathBuf::from_str(&infile)
+        let path = PathBuf::from_str(infile)
             .map_err(|e| format!("{e}"))?;
 
         let file = fs::File::options()
@@ -153,8 +135,6 @@ fn config_sanity_check(opt: &mut Opt) -> Result<ValidConfigOut, String> {
         None
     };
 
-    let is_using_dangerous_features = opt.dangerous || opt.loud;
-
     if opt.be && opt.sample_size == 8 {
         eprintln!("[!] endianness ignored (--be), irrelevant with 8-bit samples");
     }
@@ -163,26 +143,23 @@ fn config_sanity_check(opt: &mut Opt) -> Result<ValidConfigOut, String> {
         eprintln!("[!] low sample rate (<8kHz), audio may be very distorted");
     }
 
-    if opt.dangerous {
+    let acknowledged = opt.dangerous || std::env::var("RPLAY_DANGEROUS").is_ok();
+    let mut is_config_dangerous = false;
+    if acknowledged {
         eprintln!("[!] limits removed from gain input, may produce very loud sounds");
     } else {
         if !(0.0 <= opt.gain && opt.gain <= 1.0) {
             eprintln!("[!] invalid gain value {}, will be clamped between 0.0 and 1.0", opt.gain);
+            is_config_dangerous = true;
         }
-    }
-
-    if is_using_dangerous_features && !opt.i_understand {
-        eprintln!("[!] LOUD SOUND WARNING: --dangerous and --loud may generate very loud sounds that could permanently damage your hearing and/or computer.");
-        eprintln!("[!] To use these features, pass the --i-understand option to the program.");
-        std::process::exit(1);
-    }
-
-    if !opt.dangerous {
         opt.gain = opt.gain.clamp(0.0, 1.0);
     }
 
-    if !opt.loud {
-        opt.gain = opt.gain.mul_amp(0.33);
+
+    if is_config_dangerous && !acknowledged {
+        eprintln!("[!] WARNING: may generate very loud sounds that could permanently damage your hearing and/or computer.");
+        eprintln!("[!] Pass --dangerous to the program or set the RPLAY_DANGEROUS environment variable to acknowledge this.");
+        std::process::exit(1);
     }
 
     Ok(ValidConfigOut {
@@ -277,7 +254,7 @@ where
     let channels = oconfig.channels as usize;
 
     let stream = device.build_output_stream(
-        &oconfig, 
+        oconfig,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo|{
             write_data(
                 data, channels, gain, 
