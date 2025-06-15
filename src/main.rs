@@ -19,7 +19,7 @@ use bit_io::{BitReader, FromBytes};
 #[command(version, about="Playback raw audio samples.", long_about=None)]
 struct Opt {
     /// Playback sample rate
-    #[arg(short='r', long, default_value_t = 44_100)]
+    #[arg(short='r', long, default_value_t = 48_000)]
     sample_rate: u32,
 
     /// Size of samples in bits, supports: 8, 16, 32, 64
@@ -31,8 +31,6 @@ struct Opt {
     channels: u16,
 
     /// Loudness of the audio from 0.0 to 1.0
-    ///
-    /// By default, the output amplitude is reduced to 1/3rd
     ///
     /// --dangerous allows for this value to be set to higher than 1.0
     #[arg(short, long, default_value_t = 1.0)]
@@ -146,10 +144,10 @@ fn config_sanity_check(opt: &mut Opt) -> Result<ValidConfigOut, String> {
     let acknowledged = opt.dangerous || std::env::var("RPLAY_DANGEROUS").is_ok();
     let mut is_config_dangerous = false;
     if acknowledged {
-        eprintln!("[!] limits removed from gain input, may produce very loud sounds");
+        eprintln!("[!] limits removed from gain input, may produce very loud sounds above 1.0 gain.");
     } else {
         if !(0.0 <= opt.gain && opt.gain <= 1.0) {
-            eprintln!("[!] invalid gain value {}, will be clamped between 0.0 and 1.0", opt.gain);
+            eprintln!("[!] gain value {} exceeds safety limit (0.0 <= gain <= 1.0)", opt.gain);
             is_config_dangerous = true;
         }
         opt.gain = opt.gain.clamp(0.0, 1.0);
